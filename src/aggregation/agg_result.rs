@@ -9,6 +9,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::bucket::GetDocCount;
+use super::custom_agg::CustomRes;
 use super::metric::{
     ExtendedStats, PercentilesMetricResult, SingleMetricResult, Stats, TopHitsMetricResult,
 };
@@ -17,9 +18,9 @@ use crate::TantivyError;
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 /// The final aggegation result.
-pub struct AggregationResults(pub FxHashMap<String, AggregationResult>);
+pub struct AggregationResults<R>(pub FxHashMap<String, AggregationResult<R>>);
 
-impl AggregationResults {
+impl<R: CustomRes> AggregationResults<R> {
     pub(crate) fn get_bucket_count(&self) -> u64 {
         self.0
             .values()
@@ -46,18 +47,21 @@ impl AggregationResults {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 /// An aggregation is either a bucket or a metric.
-pub enum AggregationResult {
+pub enum AggregationResult<R> {
     /// Bucket result variant.
-    BucketResult(BucketResult),
+    BucketResult(BucketResult<R>),
     /// Metric result variant.
     MetricResult(MetricResult),
+    /// Custom result variant.
+    CustomResult(R),
 }
 
-impl AggregationResult {
+impl<R: CustomRes> AggregationResult<R> {
     pub(crate) fn get_bucket_count(&self) -> u64 {
         match self {
             AggregationResult::BucketResult(bucket) => bucket.get_bucket_count(),
             AggregationResult::MetricResult(_) => 0,
+            AggregationResult::CustomResult(custom) => custom.get_bucket_count(),
         }
     }
 
@@ -73,6 +77,9 @@ impl AggregationResult {
                     .to_string(),
             )),
             AggregationResult::MetricResult(metric) => metric.get_value(agg_property),
+            AggregationResult::CustomResult(custom) => {
+                custom.get_value_from_aggregation(_name, agg_property)
+            }
         }
     }
 }
@@ -127,12 +134,12 @@ impl MetricResult {
 /// BucketEntry holds bucket aggregation result types.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum BucketResult {
+pub enum BucketResult<R> {
     /// This is the range entry for a bucket, which contains a key, count, from, to, and optionally
     /// sub-aggregations.
     Range {
         /// The range buckets sorted by range.
-        buckets: BucketEntries<RangeBucketEntry>,
+        buckets: BucketEntries<RangeBucketEntry<R>>,
     },
     /// This is the histogram entry for a bucket, which contains a key, count, and optionally
     /// sub-aggregations.
@@ -142,14 +149,14 @@ pub enum BucketResult {
         /// If there are holes depends on the request, if min_doc_count is 0, then there are no
         /// holes between the first and last bucket.
         /// See [`HistogramAggregation`](super::bucket::HistogramAggregation)
-        buckets: BucketEntries<BucketEntry>,
+        buckets: BucketEntries<BucketEntry<R>>,
     },
     /// This is the term result
     Terms {
         /// The buckets.
         ///
         /// See [`TermsAggregation`](super::bucket::TermsAggregation)
-        buckets: Vec<BucketEntry>,
+        buckets: Vec<BucketEntry<R>>,
         /// The number of documents that didn’t make it into to TOP N due to shard_size or size
         sum_other_doc_count: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,7 +165,7 @@ pub enum BucketResult {
     },
 }
 
-impl BucketResult {
+impl<R: CustomRes> BucketResult<R> {
     pub(crate) fn get_bucket_count(&self) -> u64 {
         match self {
             BucketResult::Range { buckets } => {
@@ -223,7 +230,7 @@ impl<T> BucketEntries<T> {
 /// }
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BucketEntry {
+pub struct BucketEntry<R> {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// The string representation of the bucket.
     pub key_as_string: Option<String>,
@@ -233,19 +240,19 @@ pub struct BucketEntry {
     pub doc_count: u64,
     #[serde(flatten)]
     /// Sub-aggregations in this bucket.
-    pub sub_aggregation: AggregationResults,
+    pub sub_aggregation: AggregationResults<R>,
 }
-impl BucketEntry {
+impl<R: CustomRes> BucketEntry<R> {
     pub(crate) fn get_bucket_count(&self) -> u64 {
         1 + self.sub_aggregation.get_bucket_count()
     }
 }
-impl GetDocCount for &BucketEntry {
+impl<R> GetDocCount for &BucketEntry<R> {
     fn doc_count(&self) -> u64 {
         self.doc_count
     }
 }
-impl GetDocCount for BucketEntry {
+impl<R> GetDocCount for BucketEntry<R> {
     fn doc_count(&self) -> u64 {
         self.doc_count
     }
@@ -282,14 +289,14 @@ impl GetDocCount for BucketEntry {
 /// }
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RangeBucketEntry {
+pub struct RangeBucketEntry<R> {
     /// The identifier of the bucket.
     pub key: Key,
     /// Number of documents in the bucket.
     pub doc_count: u64,
     #[serde(flatten)]
     /// Sub-aggregations in this bucket.
-    pub sub_aggregation: AggregationResults,
+    pub sub_aggregation: AggregationResults<R>,
     /// The from range of the bucket. Equals `f64::MIN` when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<f64>,
@@ -303,7 +310,7 @@ pub struct RangeBucketEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to_as_string: Option<String>,
 }
-impl RangeBucketEntry {
+impl<R: CustomRes> RangeBucketEntry<R> {
     pub(crate) fn get_bucket_count(&self) -> u64 {
         1 + self.sub_aggregation.get_bucket_count()
     }

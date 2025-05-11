@@ -9,6 +9,7 @@ use super::agg_req::{Aggregation, AggregationVariants, Aggregations};
 use super::bucket::{
     DateHistogramAggregationReq, HistogramAggregation, RangeAggregation, TermsAggregation,
 };
+use super::custom_agg::CustomAgg;
 use super::metric::{
     AverageAggregation, CardinalityAggregationReq, CountAggregation, ExtendedStatsAggregation,
     MaxAggregation, MinAggregation, StatsAggregation, SumAggregation,
@@ -20,12 +21,12 @@ use crate::index::SegmentReader;
 use crate::SegmentOrdinal;
 
 #[derive(Default)]
-pub(crate) struct AggregationsWithAccessor {
-    pub aggs: VecWithNames<AggregationWithAccessor>,
+pub(crate) struct AggregationsWithAccessor<C: CustomAgg> {
+    pub aggs: VecWithNames<AggregationWithAccessor<C>>,
 }
 
-impl AggregationsWithAccessor {
-    fn from_data(aggs: VecWithNames<AggregationWithAccessor>) -> Self {
+impl<C: CustomAgg> AggregationsWithAccessor<C> {
+    fn from_data(aggs: VecWithNames<AggregationWithAccessor<C>>) -> Self {
         Self { aggs }
     }
 
@@ -34,7 +35,7 @@ impl AggregationsWithAccessor {
     }
 }
 
-pub struct AggregationWithAccessor {
+pub struct AggregationWithAccessor<C: CustomAgg> {
     pub(crate) segment_ordinal: SegmentOrdinal,
     /// In general there can be buckets without fast field access, e.g. buckets that are created
     /// based on search terms. That is not that case currently, but eventually this needs to be
@@ -44,7 +45,7 @@ pub struct AggregationWithAccessor {
     pub(crate) missing_value_for_accessor: Option<u64>,
     pub(crate) str_dict_column: Option<StrColumn>,
     pub(crate) field_type: ColumnType,
-    pub(crate) sub_aggregation: AggregationsWithAccessor,
+    pub(crate) sub_aggregation: AggregationsWithAccessor<C>,
     pub(crate) limits: AggregationLimitsGuard,
     pub(crate) column_block_accessor: ColumnBlockAccessor<u64>,
     /// Used for missing term aggregation, which checks all columns for existence.
@@ -58,24 +59,24 @@ pub struct AggregationWithAccessor {
     /// Map field names to all associated column accessors.
     /// This field is used for `docvalue_fields`, which is currently only supported for `top_hits`.
     pub(crate) value_accessors: HashMap<String, Vec<DynamicColumn>>,
-    pub(crate) agg: Aggregation,
+    pub(crate) agg: Aggregation<C>,
 }
 
-impl AggregationWithAccessor {
+impl<C: CustomAgg> AggregationWithAccessor<C> {
     /// May return multiple accessors if the aggregation is e.g. on mixed field types.
     fn try_from_agg(
-        agg: &Aggregation,
-        sub_aggregation: &Aggregations,
+        agg: &Aggregation<C>,
+        sub_aggregation: &Aggregations<C>,
         reader: &SegmentReader,
         segment_ordinal: SegmentOrdinal,
         limits: AggregationLimitsGuard,
-    ) -> crate::Result<Vec<AggregationWithAccessor>> {
+    ) -> crate::Result<Vec<AggregationWithAccessor<C>>> {
         let mut agg = agg.clone();
 
-        let add_agg_with_accessor = |agg: &Aggregation,
+        let add_agg_with_accessor = |agg: &Aggregation<C>,
                                      accessor: Column<u64>,
                                      column_type: ColumnType,
-                                     aggs: &mut Vec<AggregationWithAccessor>|
+                                     aggs: &mut Vec<AggregationWithAccessor<C>>|
          -> crate::Result<()> {
             let res = AggregationWithAccessor {
                 segment_ordinal,
@@ -99,9 +100,9 @@ impl AggregationWithAccessor {
             Ok(())
         };
 
-        let add_agg_with_accessors = |agg: &Aggregation,
+        let add_agg_with_accessors = |agg: &Aggregation<C>,
                                       accessors: Vec<(Column<u64>, ColumnType)>,
-                                      aggs: &mut Vec<AggregationWithAccessor>,
+                                      aggs: &mut Vec<AggregationWithAccessor<C>>,
                                       value_accessors: HashMap<String, Vec<DynamicColumn>>|
          -> crate::Result<()> {
             let (accessor, field_type) = accessors.first().expect("at least one accessor");
@@ -129,7 +130,7 @@ impl AggregationWithAccessor {
             Ok(())
         };
 
-        let mut res: Vec<AggregationWithAccessor> = Vec::new();
+        let mut res: Vec<AggregationWithAccessor<C>> = Vec::new();
         use AggregationVariants::*;
 
         match agg.agg {
@@ -344,6 +345,17 @@ impl AggregationWithAccessor {
 
                 add_agg_with_accessors(&agg, accessors, &mut res, value_accessors)?;
             }
+            Custom(ref custom) => {
+                // TODO this limits us to numeric columns, we should aim for more complex values.
+                let accessors: Vec<(Column<u64>, ColumnType)> = custom
+                    .field_names()
+                    .iter()
+                    .map(|field| {
+                        get_ff_reader(reader, field, Some(get_numeric_or_date_column_types()))
+                    })
+                    .collect::<crate::Result<_>>()?;
+                add_agg_with_accessors(&agg, accessors, &mut res, Default::default())?;
+            }
         };
 
         Ok(res)
@@ -397,12 +409,12 @@ fn get_numeric_or_date_column_types() -> &'static [ColumnType] {
     ]
 }
 
-pub(crate) fn get_aggs_with_segment_accessor_and_validate(
-    aggs: &Aggregations,
+pub(crate) fn get_aggs_with_segment_accessor_and_validate<C: CustomAgg>(
+    aggs: &Aggregations<C>,
     reader: &SegmentReader,
     segment_ordinal: SegmentOrdinal,
     limits: &AggregationLimitsGuard,
-) -> crate::Result<AggregationsWithAccessor> {
+) -> crate::Result<AggregationsWithAccessor<C>> {
     let mut aggss = Vec::new();
     for (key, agg) in aggs.iter() {
         let aggs = AggregationWithAccessor::try_from_agg(

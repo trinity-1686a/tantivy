@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor;
+use crate::aggregation::custom_agg::CustomAgg;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
     IntermediateKey, IntermediateTermBucketEntry, IntermediateTermBucketResult,
@@ -10,16 +11,27 @@ use crate::aggregation::segment_agg_result::{
 };
 
 /// The specialized missing term aggregation.
-#[derive(Default, Debug, Clone)]
-pub struct TermMissingAgg {
+#[derive(Debug, Clone)]
+pub struct TermMissingAgg<C: CustomAgg> {
     missing_count: u32,
     accessor_idx: usize,
-    sub_agg: Option<Box<dyn SegmentAggregationCollector>>,
+    sub_agg: Option<Box<dyn SegmentAggregationCollector<C>>>,
 }
-impl TermMissingAgg {
+
+impl<C: CustomAgg> Default for TermMissingAgg<C> {
+    fn default() -> Self {
+        TermMissingAgg {
+            missing_count: 0,
+            accessor_idx: 0,
+            sub_agg: None,
+        }
+    }
+}
+
+impl<C: CustomAgg> TermMissingAgg<C> {
     pub(crate) fn new(
         accessor_idx: usize,
-        sub_aggregations: &mut AggregationsWithAccessor,
+        sub_aggregations: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<Self> {
         let has_sub_aggregations = !sub_aggregations.is_empty();
         let sub_agg = if has_sub_aggregations {
@@ -37,11 +49,11 @@ impl TermMissingAgg {
     }
 }
 
-impl SegmentAggregationCollector for TermMissingAgg {
+impl<C: CustomAgg> SegmentAggregationCollector<C> for TermMissingAgg<C> {
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
-        agg_with_accessor: &AggregationsWithAccessor,
-        results: &mut IntermediateAggregationResults,
+        agg_with_accessor: &AggregationsWithAccessor<C>,
+        results: &mut IntermediateAggregationResults<C::IntermediateRes>,
     ) -> crate::Result<()> {
         let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
         let agg_with_accessor = &agg_with_accessor.aggs.values[self.accessor_idx];
@@ -55,8 +67,10 @@ impl SegmentAggregationCollector for TermMissingAgg {
             .as_ref()
             .expect("TermMissingAgg collector, but no missing found in agg req")
             .clone();
-        let mut entries: FxHashMap<IntermediateKey, IntermediateTermBucketEntry> =
-            Default::default();
+        let mut entries: FxHashMap<
+            IntermediateKey,
+            IntermediateTermBucketEntry<C::IntermediateRes>,
+        > = Default::default();
 
         let mut missing_entry = IntermediateTermBucketEntry {
             doc_count: self.missing_count,
@@ -88,7 +102,7 @@ impl SegmentAggregationCollector for TermMissingAgg {
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         let agg = &mut agg_with_accessor.aggs.values[self.accessor_idx];
         let has_value = agg
@@ -107,7 +121,7 @@ impl SegmentAggregationCollector for TermMissingAgg {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         for doc in docs {
             self.collect(*doc, agg_with_accessor)?;

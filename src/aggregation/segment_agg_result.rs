@@ -9,6 +9,7 @@ pub(crate) use super::agg_limits::AggregationLimitsGuard;
 use super::agg_req::AggregationVariants;
 use super::agg_req_with_accessor::{AggregationWithAccessor, AggregationsWithAccessor};
 use super::bucket::{SegmentHistogramCollector, SegmentRangeCollector, SegmentTermCollector};
+use super::custom_agg::{CustomAgg, CustomIntermediateRes};
 use super::intermediate_agg_result::IntermediateAggregationResults;
 use super::metric::{
     AverageAggregation, CountAggregation, ExtendedStatsAggregation, MaxAggregation, MinAggregation,
@@ -21,53 +22,55 @@ use crate::aggregation::metric::{
     TopHitsSegmentCollector,
 };
 
-pub(crate) trait SegmentAggregationCollector: CollectorClone + Debug {
+pub(crate) trait SegmentAggregationCollector<C: CustomAgg>:
+    CollectorClone<C> + Debug
+{
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
-        agg_with_accessor: &AggregationsWithAccessor,
-        results: &mut IntermediateAggregationResults,
+        agg_with_accessor: &AggregationsWithAccessor<C>,
+        results: &mut IntermediateAggregationResults<C::IntermediateRes>,
     ) -> crate::Result<()>;
 
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()>;
 
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()>;
 
     /// Finalize method. Some Aggregator collect blocks of docs before calling `collect_block`.
     /// This method ensures those staged docs will be collected.
-    fn flush(&mut self, _agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
+    fn flush(&mut self, _agg_with_accessor: &mut AggregationsWithAccessor<C>) -> crate::Result<()> {
         Ok(())
     }
 }
 
-pub(crate) trait CollectorClone {
-    fn clone_box(&self) -> Box<dyn SegmentAggregationCollector>;
+pub(crate) trait CollectorClone<C> {
+    fn clone_box(&self) -> Box<dyn SegmentAggregationCollector<C>>;
 }
 
-impl<T> CollectorClone for T
-where T: 'static + SegmentAggregationCollector + Clone
+impl<T, C: CustomAgg> CollectorClone<C> for T
+where T: 'static + SegmentAggregationCollector<C> + Clone
 {
-    fn clone_box(&self) -> Box<dyn SegmentAggregationCollector> {
+    fn clone_box(&self) -> Box<dyn SegmentAggregationCollector<C>> {
         Box::new(self.clone())
     }
 }
 
-impl Clone for Box<dyn SegmentAggregationCollector> {
-    fn clone(&self) -> Box<dyn SegmentAggregationCollector> {
+impl<C: CustomAgg> Clone for Box<dyn SegmentAggregationCollector<C>> {
+    fn clone(&self) -> Box<dyn SegmentAggregationCollector<C>> {
         self.clone_box()
     }
 }
 
-pub(crate) fn build_segment_agg_collector(
-    req: &mut AggregationsWithAccessor,
-) -> crate::Result<Box<dyn SegmentAggregationCollector>> {
+pub(crate) fn build_segment_agg_collector<C: CustomAgg>(
+    req: &mut AggregationsWithAccessor<C>,
+) -> crate::Result<Box<dyn SegmentAggregationCollector<C>>> {
     // Single collector special case
     if req.aggs.len() == 1 {
         let req = &mut req.aggs.values[0];
@@ -79,10 +82,10 @@ pub(crate) fn build_segment_agg_collector(
     Ok(Box::new(agg))
 }
 
-pub(crate) fn build_single_agg_segment_collector(
-    req: &mut AggregationWithAccessor,
+pub(crate) fn build_single_agg_segment_collector<C: CustomAgg>(
+    req: &mut AggregationWithAccessor<C>,
     accessor_idx: usize,
-) -> crate::Result<Box<dyn SegmentAggregationCollector>> {
+) -> crate::Result<Box<dyn SegmentAggregationCollector<C>>> {
     use AggregationVariants::*;
     match &req.agg.agg {
         Terms(terms_req) => {
@@ -175,6 +178,14 @@ pub(crate) fn build_single_agg_segment_collector(
         Cardinality(CardinalityAggregationReq { missing, .. }) => Ok(Box::new(
             SegmentCardinalityCollector::from_req(req.field_type, accessor_idx, missing),
         )),
+        Custom(custom) => custom
+            .new_segment_collector(
+                &mut req.sub_aggregation,
+                &mut req.limits,
+                req.field_type,
+                accessor_idx,
+            )
+            .map(|collector| Box::new(collector) as _),
     }
 }
 
@@ -182,11 +193,11 @@ pub(crate) fn build_single_agg_segment_collector(
 /// The GenericSegmentAggregationResultsCollector is the generic version of the collector, which
 /// can handle arbitrary complexity of  sub-aggregations. Ideally we never have to pick this one
 /// and can provide specialized versions instead, that remove some of its overhead.
-pub(crate) struct GenericSegmentAggregationResultsCollector {
-    pub(crate) aggs: Vec<Box<dyn SegmentAggregationCollector>>,
+pub(crate) struct GenericSegmentAggregationResultsCollector<C: CustomAgg> {
+    pub(crate) aggs: Vec<Box<dyn SegmentAggregationCollector<C>>>,
 }
 
-impl Debug for GenericSegmentAggregationResultsCollector {
+impl<C: CustomAgg> Debug for GenericSegmentAggregationResultsCollector<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SegmentAggregationResultsCollector")
             .field("aggs", &self.aggs)
@@ -194,11 +205,11 @@ impl Debug for GenericSegmentAggregationResultsCollector {
     }
 }
 
-impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
+impl<C: CustomAgg> SegmentAggregationCollector<C> for GenericSegmentAggregationResultsCollector<C> {
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
-        agg_with_accessor: &AggregationsWithAccessor,
-        results: &mut IntermediateAggregationResults,
+        agg_with_accessor: &AggregationsWithAccessor<C>,
+        results: &mut IntermediateAggregationResults<C::IntermediateRes>,
     ) -> crate::Result<()> {
         for agg in self.aggs {
             agg.add_intermediate_aggregation_result(agg_with_accessor, results)?;
@@ -210,7 +221,7 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         self.collect_block(&[doc], agg_with_accessor)?;
 
@@ -220,7 +231,7 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         for collector in &mut self.aggs {
             collector.collect_block(docs, agg_with_accessor)?;
@@ -229,7 +240,7 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
         Ok(())
     }
 
-    fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
+    fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor<C>) -> crate::Result<()> {
         for collector in &mut self.aggs {
             collector.flush(agg_with_accessor)?;
         }
@@ -237,14 +248,16 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
     }
 }
 
-impl GenericSegmentAggregationResultsCollector {
-    pub(crate) fn from_req_and_validate(req: &mut AggregationsWithAccessor) -> crate::Result<Self> {
+impl<C: CustomAgg> GenericSegmentAggregationResultsCollector<C> {
+    pub(crate) fn from_req_and_validate(
+        req: &mut AggregationsWithAccessor<C>,
+    ) -> crate::Result<Self> {
         let aggs = req
             .aggs
             .values_mut()
             .enumerate()
             .map(|(accessor_idx, req)| build_single_agg_segment_collector(req, accessor_idx))
-            .collect::<crate::Result<Vec<Box<dyn SegmentAggregationCollector>>>>()?;
+            .collect::<crate::Result<Vec<Box<dyn SegmentAggregationCollector<C>>>>>()?;
 
         Ok(GenericSegmentAggregationResultsCollector { aggs })
     }

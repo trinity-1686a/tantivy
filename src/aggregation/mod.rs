@@ -134,6 +134,7 @@ pub mod agg_result;
 pub mod bucket;
 mod buf_collector;
 mod collector;
+mod custom_agg;
 mod date;
 mod error;
 pub mod intermediate_agg_result;

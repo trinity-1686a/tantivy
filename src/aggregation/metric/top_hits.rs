@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{TopHitsMetricResult, TopHitsVecEntry};
 use crate::aggregation::bucket::Order;
+use crate::aggregation::custom_agg::CustomAgg;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateMetricResult,
 };
@@ -562,11 +563,13 @@ impl TopHitsSegmentCollector {
     }
 }
 
-impl SegmentAggregationCollector for TopHitsSegmentCollector {
+impl<C: CustomAgg> SegmentAggregationCollector<C> for TopHitsSegmentCollector {
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
-        agg_with_accessor: &crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor,
-        results: &mut crate::aggregation::intermediate_agg_result::IntermediateAggregationResults,
+        agg_with_accessor: &crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor<C>,
+        results: &mut crate::aggregation::intermediate_agg_result::IntermediateAggregationResults<
+            C::IntermediateRes,
+        >,
     ) -> crate::Result<()> {
         let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
 
@@ -590,7 +593,9 @@ impl SegmentAggregationCollector for TopHitsSegmentCollector {
     fn collect(
         &mut self,
         doc_id: crate::DocId,
-        agg_with_accessor: &mut crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor,
+        agg_with_accessor: &mut crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor<
+            C,
+        >,
     ) -> crate::Result<()> {
         let tophits_req = &agg_with_accessor.aggs.values[self.accessor_idx]
             .agg
@@ -605,7 +610,9 @@ impl SegmentAggregationCollector for TopHitsSegmentCollector {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor,
+        agg_with_accessor: &mut crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor<
+            C,
+        >,
     ) -> crate::Result<()> {
         let tophits_req = &agg_with_accessor.aggs.values[self.accessor_idx]
             .agg

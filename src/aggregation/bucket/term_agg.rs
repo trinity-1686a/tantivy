@@ -14,6 +14,7 @@ use crate::aggregation::agg_limits::MemoryConsumption;
 use crate::aggregation::agg_req_with_accessor::{
     AggregationWithAccessor, AggregationsWithAccessor,
 };
+use crate::aggregation::custom_agg::{CustomAgg, CustomIntermediateRes};
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
     IntermediateKey, IntermediateTermBucketEntry, IntermediateTermBucketResult,
@@ -219,14 +220,23 @@ impl TermsAggregationInternal {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 /// Container to store term_ids/or u64 values and their buckets.
-struct TermBuckets {
+struct TermBuckets<C: CustomAgg> {
     pub(crate) entries: FxHashMap<u64, u32>,
-    pub(crate) sub_aggs: FxHashMap<u64, Box<dyn SegmentAggregationCollector>>,
+    pub(crate) sub_aggs: FxHashMap<u64, Box<dyn SegmentAggregationCollector<C>>>,
 }
 
-impl TermBuckets {
+impl<C: CustomAgg> Default for TermBuckets<C> {
+    fn default() -> Self {
+        TermBuckets {
+            entries: FxHashMap::default(),
+            sub_aggs: FxHashMap::default(),
+        }
+    }
+}
+
+impl<C: CustomAgg> TermBuckets<C> {
     fn get_memory_consumption(&self) -> usize {
         let sub_aggs_mem = self.sub_aggs.memory_consumption();
         let buckets_mem = self.entries.memory_consumption();
@@ -235,7 +245,7 @@ impl TermBuckets {
 
     fn force_flush(
         &mut self,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         for sub_aggregations in &mut self.sub_aggs.values_mut() {
             sub_aggregations.as_mut().flush(agg_with_accessor)?;
@@ -247,11 +257,11 @@ impl TermBuckets {
 /// The collector puts values from the fast field into the correct buckets and does a conversion to
 /// the correct datatype.
 #[derive(Clone, Debug)]
-pub struct SegmentTermCollector {
+pub struct SegmentTermCollector<C: CustomAgg> {
     /// The buckets containing the aggregation data.
-    term_buckets: TermBuckets,
+    term_buckets: TermBuckets<C>,
     req: TermsAggregationInternal,
-    blueprint: Option<Box<dyn SegmentAggregationCollector>>,
+    blueprint: Option<Box<dyn SegmentAggregationCollector<C>>>,
     column_type: ColumnType,
     accessor_idx: usize,
 }
@@ -261,11 +271,11 @@ pub(crate) fn get_agg_name_and_property(name: &str) -> (&str, &str) {
     (agg_name, agg_property)
 }
 
-impl SegmentAggregationCollector for SegmentTermCollector {
+impl<C: CustomAgg> SegmentAggregationCollector<C> for SegmentTermCollector<C> {
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
-        agg_with_accessor: &AggregationsWithAccessor,
-        results: &mut IntermediateAggregationResults,
+        agg_with_accessor: &AggregationsWithAccessor<C>,
+        results: &mut IntermediateAggregationResults<C::IntermediateRes>,
     ) -> crate::Result<()> {
         let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
         let agg_with_accessor = &agg_with_accessor.aggs.values[self.accessor_idx];
@@ -280,7 +290,7 @@ impl SegmentAggregationCollector for SegmentTermCollector {
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         self.collect_block(&[doc], agg_with_accessor)
     }
@@ -289,7 +299,7 @@ impl SegmentAggregationCollector for SegmentTermCollector {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         let bucket_agg_accessor = &mut agg_with_accessor.aggs.values[self.accessor_idx];
 
@@ -334,7 +344,7 @@ impl SegmentAggregationCollector for SegmentTermCollector {
         Ok(())
     }
 
-    fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
+    fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor<C>) -> crate::Result<()> {
         let sub_aggregation_accessor =
             &mut agg_with_accessor.aggs.values[self.accessor_idx].sub_aggregation;
 
@@ -343,7 +353,7 @@ impl SegmentAggregationCollector for SegmentTermCollector {
     }
 }
 
-impl SegmentTermCollector {
+impl<C: CustomAgg> SegmentTermCollector<C> {
     fn get_memory_consumption(&self) -> usize {
         let self_mem = std::mem::size_of::<Self>();
         let term_buckets_mem = self.term_buckets.get_memory_consumption();
@@ -352,7 +362,7 @@ impl SegmentTermCollector {
 
     pub(crate) fn from_req_and_validate(
         req: &TermsAggregation,
-        sub_aggregations: &mut AggregationsWithAccessor,
+        sub_aggregations: &mut AggregationsWithAccessor<C>,
         field_type: ColumnType,
         accessor_idx: usize,
     ) -> crate::Result<Self> {
@@ -361,7 +371,7 @@ impl SegmentTermCollector {
                 "terms aggregation is not supported for column type {field_type:?}"
             )));
         }
-        let term_buckets = TermBuckets::default();
+        let term_buckets = TermBuckets::<C>::default();
 
         if let Some(custom_order) = req.order.as_ref() {
             // Validate sub aggregation exists
@@ -397,8 +407,8 @@ impl SegmentTermCollector {
     #[inline]
     pub(crate) fn into_intermediate_bucket_result(
         mut self,
-        agg_with_accessor: &AggregationWithAccessor,
-    ) -> crate::Result<IntermediateBucketResult> {
+        agg_with_accessor: &AggregationWithAccessor<C>,
+    ) -> crate::Result<IntermediateBucketResult<C::IntermediateRes>> {
         let mut entries: Vec<(u64, u32)> = self.term_buckets.entries.into_iter().collect();
 
         let order_by_sub_aggregation =
@@ -435,11 +445,12 @@ impl SegmentTermCollector {
             cut_off_buckets(&mut entries, self.req.segment_size as usize)
         };
 
-        let mut dict: FxHashMap<IntermediateKey, IntermediateTermBucketEntry> = Default::default();
+        let mut dict: FxHashMap<IntermediateKey, IntermediateTermBucketEntry<C::IntermediateRes>> =
+            Default::default();
         dict.reserve(entries.len());
 
         let mut into_intermediate_bucket_entry =
-            |id, doc_count| -> crate::Result<IntermediateTermBucketEntry> {
+            |id, doc_count| -> crate::Result<IntermediateTermBucketEntry<C::IntermediateRes>> {
                 let intermediate_entry = if self.blueprint.as_ref().is_some() {
                     let mut sub_aggregation_res = IntermediateAggregationResults::default();
                     self.term_buckets
@@ -632,7 +643,7 @@ impl GetDocCount for (u64, u32) {
         self.1 as u64
     }
 }
-impl GetDocCount for (String, IntermediateTermBucketEntry) {
+impl<I> GetDocCount for (String, IntermediateTermBucketEntry<I>) {
     fn doc_count(&self) -> u64 {
         self.1.doc_count as u64
     }

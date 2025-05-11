@@ -2,6 +2,7 @@ use super::agg_req::Aggregations;
 use super::agg_req_with_accessor::AggregationsWithAccessor;
 use super::agg_result::AggregationResults;
 use super::buf_collector::BufAggregationCollector;
+use super::custom_agg::{CustomAgg, CustomIntermediateRes};
 use super::intermediate_agg_result::IntermediateAggregationResults;
 use super::segment_agg_result::{
     build_segment_agg_collector, AggregationLimitsGuard, SegmentAggregationCollector,
@@ -20,17 +21,17 @@ pub const DEFAULT_MEMORY_LIMIT: u64 = 500_000_000;
 /// Collector for aggregations.
 ///
 /// The collector collects all aggregations by the underlying aggregation request.
-pub struct AggregationCollector {
-    agg: Aggregations,
+pub struct AggregationCollector<C: CustomAgg> {
+    agg: Aggregations<C>,
     limits: AggregationLimitsGuard,
 }
 
-impl AggregationCollector {
+impl<C: CustomAgg> AggregationCollector<C> {
     /// Create collector from aggregation request.
     ///
     /// Aggregation fails when the limits in `AggregationLimits` is exceeded. (memory limit and
     /// bucket limit)
-    pub fn from_aggs(agg: Aggregations, limits: AggregationLimitsGuard) -> Self {
+    pub fn from_aggs(agg: Aggregations<C>, limits: AggregationLimitsGuard) -> Self {
         Self { agg, limits }
     }
 }
@@ -43,25 +44,25 @@ impl AggregationCollector {
 /// AggregationCollector returns `IntermediateAggregationResults` and not the final
 /// `AggregationResults`, so that results from different indices can be merged and then converted
 /// into the final `AggregationResults` via the `into_final_result()` method.
-pub struct DistributedAggregationCollector {
-    agg: Aggregations,
+pub struct DistributedAggregationCollector<C: CustomAgg> {
+    agg: Aggregations<C>,
     limits: AggregationLimitsGuard,
 }
 
-impl DistributedAggregationCollector {
+impl<C: CustomAgg> DistributedAggregationCollector<C> {
     /// Create collector from aggregation request.
     ///
     /// Aggregation fails when the limits in `AggregationLimits` is exceeded. (memory limit and
     /// bucket limit)
-    pub fn from_aggs(agg: Aggregations, limits: AggregationLimitsGuard) -> Self {
+    pub fn from_aggs(agg: Aggregations<C>, limits: AggregationLimitsGuard) -> Self {
         Self { agg, limits }
     }
 }
 
-impl Collector for DistributedAggregationCollector {
-    type Fruit = IntermediateAggregationResults;
+impl<C: CustomAgg> Collector for DistributedAggregationCollector<C> {
+    type Fruit = IntermediateAggregationResults<C::IntermediateRes>;
 
-    type Child = AggregationSegmentCollector;
+    type Child = AggregationSegmentCollector<C>;
 
     fn for_segment(
         &self,
@@ -88,10 +89,10 @@ impl Collector for DistributedAggregationCollector {
     }
 }
 
-impl Collector for AggregationCollector {
-    type Fruit = AggregationResults;
+impl<C: CustomAgg> Collector for AggregationCollector<C> {
+    type Fruit = AggregationResults<C::FinalRes>;
 
-    type Child = AggregationSegmentCollector;
+    type Child = AggregationSegmentCollector<C>;
 
     fn for_segment(
         &self,
@@ -119,9 +120,9 @@ impl Collector for AggregationCollector {
     }
 }
 
-fn merge_fruits(
-    mut segment_fruits: Vec<crate::Result<IntermediateAggregationResults>>,
-) -> crate::Result<IntermediateAggregationResults> {
+fn merge_fruits<I: CustomIntermediateRes>(
+    mut segment_fruits: Vec<crate::Result<IntermediateAggregationResults<I>>>,
+) -> crate::Result<IntermediateAggregationResults<I>> {
     if let Some(fruit) = segment_fruits.pop() {
         let mut fruit = fruit?;
         for next_fruit in segment_fruits {
@@ -134,17 +135,17 @@ fn merge_fruits(
 }
 
 /// `AggregationSegmentCollector` does the aggregation collection on a segment.
-pub struct AggregationSegmentCollector {
-    aggs_with_accessor: AggregationsWithAccessor,
-    agg_collector: BufAggregationCollector,
+pub struct AggregationSegmentCollector<C: CustomAgg> {
+    aggs_with_accessor: AggregationsWithAccessor<C>,
+    agg_collector: BufAggregationCollector<C>,
     error: Option<TantivyError>,
 }
 
-impl AggregationSegmentCollector {
+impl<C: CustomAgg> AggregationSegmentCollector<C> {
     /// Creates an `AggregationSegmentCollector from` an [`Aggregations`] request and a segment
     /// reader. Also includes validation, e.g. checking field types and existence.
     pub fn from_agg_req_and_reader(
-        agg: &Aggregations,
+        agg: &Aggregations<C>,
         reader: &SegmentReader,
         segment_ordinal: SegmentOrdinal,
         limits: &AggregationLimitsGuard,
@@ -161,8 +162,8 @@ impl AggregationSegmentCollector {
     }
 }
 
-impl SegmentCollector for AggregationSegmentCollector {
-    type Fruit = crate::Result<IntermediateAggregationResults>;
+impl<C: CustomAgg> SegmentCollector for AggregationSegmentCollector<C> {
+    type Fruit = crate::Result<IntermediateAggregationResults<C::IntermediateRes>>;
 
     #[inline]
     fn collect(&mut self, doc: DocId, _score: crate::Score) {

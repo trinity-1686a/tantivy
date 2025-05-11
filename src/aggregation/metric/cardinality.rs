@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::aggregation::agg_req_with_accessor::{
     AggregationWithAccessor, AggregationsWithAccessor,
 };
+use crate::aggregation::custom_agg::CustomAgg;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
 };
@@ -131,10 +132,10 @@ impl SegmentCardinalityCollector {
         }
     }
 
-    fn fetch_block_with_field(
+    fn fetch_block_with_field<C: CustomAgg>(
         &mut self,
         docs: &[crate::DocId],
-        agg_accessor: &mut AggregationWithAccessor,
+        agg_accessor: &mut AggregationWithAccessor<C>,
     ) {
         if let Some(missing) = agg_accessor.missing_value_for_accessor {
             agg_accessor.column_block_accessor.fetch_block_with_missing(
@@ -149,9 +150,9 @@ impl SegmentCardinalityCollector {
         }
     }
 
-    fn into_intermediate_metric_result(
+    fn into_intermediate_metric_result<C: CustomAgg>(
         mut self,
-        agg_with_accessor: &AggregationWithAccessor,
+        agg_with_accessor: &AggregationWithAccessor<C>,
     ) -> crate::Result<IntermediateMetricResult> {
         if self.column_type == ColumnType::Str {
             let fallback_dict = Dictionary::empty();
@@ -206,11 +207,11 @@ impl SegmentCardinalityCollector {
     }
 }
 
-impl SegmentAggregationCollector for SegmentCardinalityCollector {
+impl<C: CustomAgg> SegmentAggregationCollector<C> for SegmentCardinalityCollector {
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
-        agg_with_accessor: &AggregationsWithAccessor,
-        results: &mut IntermediateAggregationResults,
+        agg_with_accessor: &AggregationsWithAccessor<C>,
+        results: &mut IntermediateAggregationResults<C::IntermediateRes>,
     ) -> crate::Result<()> {
         let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
         let agg_with_accessor = &agg_with_accessor.aggs.values[self.accessor_idx];
@@ -227,7 +228,7 @@ impl SegmentAggregationCollector for SegmentCardinalityCollector {
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         self.collect_block(&[doc], agg_with_accessor)
     }
@@ -235,7 +236,7 @@ impl SegmentAggregationCollector for SegmentCardinalityCollector {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         let bucket_agg_accessor = &mut agg_with_accessor.aggs.values[self.accessor_idx];
         self.fetch_block_with_field(docs, bucket_agg_accessor);

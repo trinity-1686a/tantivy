@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use super::bucket::{
     DateHistogramAggregationReq, HistogramAggregation, RangeAggregation, TermsAggregation,
 };
+use super::custom_agg::CustomAgg;
 use super::metric::{
     AverageAggregation, CardinalityAggregationReq, CountAggregation, ExtendedStatsAggregation,
     MaxAggregation, MinAggregation, PercentilesAggregationReq, StatsAggregation, SumAggregation,
@@ -43,44 +44,46 @@ use super::metric::{
 /// defined names. It is also used in buckets aggregations to define sub-aggregations.
 ///
 /// The key is the user defined name of the aggregation.
-pub type Aggregations = HashMap<String, Aggregation>;
+pub type Aggregations<C> = HashMap<String, Aggregation<C>>;
 
 /// Aggregation request.
 ///
 /// An aggregation is either a bucket or a metric.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "AggregationForDeserialization")]
-pub struct Aggregation {
+#[serde(try_from = "AggregationForDeserialization<C>")]
+#[serde(bound = "")]
+pub struct Aggregation<C: CustomAgg> {
     /// The aggregation variant, which can be either a bucket or a metric.
     #[serde(flatten)]
-    pub agg: AggregationVariants,
+    pub agg: AggregationVariants<C>,
     /// on the document set in the bucket.
     #[serde(rename = "aggs")]
     #[serde(skip_serializing_if = "Aggregations::is_empty")]
-    pub sub_aggregation: Aggregations,
+    pub sub_aggregation: Aggregations<C>,
 }
 
 /// In order to display proper error message, we cannot rely on flattening
 /// the json enum. Instead we introduce an intermediary struct to separate
 /// the aggregation from the subaggregation.
 #[derive(Deserialize)]
-struct AggregationForDeserialization {
+#[serde(bound = "")]
+struct AggregationForDeserialization<C: CustomAgg> {
     #[serde(flatten)]
     pub aggs_remaining_json: serde_json::Value,
     #[serde(rename = "aggs")]
     #[serde(default)]
-    pub sub_aggregation: Aggregations,
+    pub sub_aggregation: Aggregations<C>,
 }
 
-impl TryFrom<AggregationForDeserialization> for Aggregation {
+impl<C: CustomAgg> TryFrom<AggregationForDeserialization<C>> for Aggregation<C> {
     type Error = serde_json::Error;
 
-    fn try_from(value: AggregationForDeserialization) -> serde_json::Result<Self> {
+    fn try_from(value: AggregationForDeserialization<C>) -> serde_json::Result<Self> {
         let AggregationForDeserialization {
             aggs_remaining_json,
             sub_aggregation,
         } = value;
-        let agg: AggregationVariants = serde_json::from_value(aggs_remaining_json)?;
+        let agg: AggregationVariants<C> = serde_json::from_value(aggs_remaining_json)?;
         Ok(Aggregation {
             agg,
             sub_aggregation,
@@ -88,8 +91,8 @@ impl TryFrom<AggregationForDeserialization> for Aggregation {
     }
 }
 
-impl Aggregation {
-    pub(crate) fn sub_aggregation(&self) -> &Aggregations {
+impl<C: CustomAgg> Aggregation<C> {
+    pub(crate) fn sub_aggregation(&self) -> &Aggregations<C> {
         &self.sub_aggregation
     }
 
@@ -105,7 +108,7 @@ impl Aggregation {
 }
 
 /// Extract all fast field names used in the tree.
-pub fn get_fast_field_names(aggs: &Aggregations) -> HashSet<String> {
+pub fn get_fast_field_names(aggs: &Aggregations<impl CustomAgg>) -> HashSet<String> {
     let mut fast_field_names = Default::default();
     for el in aggs.values() {
         el.get_fast_field_names(&mut fast_field_names)
@@ -115,7 +118,7 @@ pub fn get_fast_field_names(aggs: &Aggregations) -> HashSet<String> {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 /// All aggregation types.
-pub enum AggregationVariants {
+pub enum AggregationVariants<C> {
     // Bucket aggregation types
     /// Put data into buckets of user-defined ranges.
     #[serde(rename = "range")]
@@ -164,9 +167,14 @@ pub enum AggregationVariants {
     /// Computes an estimate of the number of unique values
     #[serde(rename = "cardinality")]
     Cardinality(CardinalityAggregationReq),
+
+    // Custom aggreation
+    /// A custom aggregation
+    #[serde(untagged)]
+    Custom(C),
 }
 
-impl AggregationVariants {
+impl<C: CustomAgg> AggregationVariants<C> {
     /// Returns the name of the fields used by the aggregation.
     pub fn get_fast_field_names(&self) -> Vec<&str> {
         match self {
@@ -183,7 +191,8 @@ impl AggregationVariants {
             AggregationVariants::Sum(sum) => vec![sum.field_name()],
             AggregationVariants::Percentiles(per) => vec![per.field_name()],
             AggregationVariants::TopHits(top_hits) => top_hits.field_names(),
-            AggregationVariants::Cardinality(per) => vec![per.field_name()],
+            AggregationVariants::Cardinality(card) => vec![card.field_name()],
+            AggregationVariants::Custom(custom) => custom.field_names(),
         }
     }
 

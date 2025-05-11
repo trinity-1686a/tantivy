@@ -6,6 +6,7 @@ use super::*;
 use crate::aggregation::agg_req_with_accessor::{
     AggregationWithAccessor, AggregationsWithAccessor,
 };
+use crate::aggregation::custom_agg::CustomAgg;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
 };
@@ -249,10 +250,10 @@ impl SegmentPercentilesCollector {
         })
     }
     #[inline]
-    pub(crate) fn collect_block_with_field(
+    pub(crate) fn collect_block_with_field<C: CustomAgg>(
         &mut self,
         docs: &[DocId],
-        agg_accessor: &mut AggregationWithAccessor,
+        agg_accessor: &mut AggregationWithAccessor<C>,
     ) {
         if let Some(missing) = self.missing.as_ref() {
             agg_accessor.column_block_accessor.fetch_block_with_missing(
@@ -273,12 +274,12 @@ impl SegmentPercentilesCollector {
     }
 }
 
-impl SegmentAggregationCollector for SegmentPercentilesCollector {
+impl<C: CustomAgg> SegmentAggregationCollector<C> for SegmentPercentilesCollector {
     #[inline]
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
-        agg_with_accessor: &AggregationsWithAccessor,
-        results: &mut IntermediateAggregationResults,
+        agg_with_accessor: &AggregationsWithAccessor<C>,
+        results: &mut IntermediateAggregationResults<C::IntermediateRes>,
     ) -> crate::Result<()> {
         let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
         let intermediate_metric_result = IntermediateMetricResult::Percentiles(self.percentiles);
@@ -295,7 +296,7 @@ impl SegmentAggregationCollector for SegmentPercentilesCollector {
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         let field = &agg_with_accessor.aggs.values[self.accessor_idx].accessor;
 
@@ -324,7 +325,7 @@ impl SegmentAggregationCollector for SegmentPercentilesCollector {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor<C>,
     ) -> crate::Result<()> {
         let field = &mut agg_with_accessor.aggs.values[self.accessor_idx];
         self.collect_block_with_field(docs, field);

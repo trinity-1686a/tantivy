@@ -18,6 +18,7 @@ use super::bucket::{
     cut_off_buckets, get_agg_name_and_property, intermediate_histogram_buckets_to_final_buckets,
     GetDocCount, Order, OrderTarget, RangeAggregation, TermsAggregation,
 };
+use super::custom_agg::{CustomAgg, CustomIntermediateRes};
 use super::metric::{
     IntermediateAverage, IntermediateCount, IntermediateExtendedStats, IntermediateMax,
     IntermediateMin, IntermediateStats, IntermediateSum, PercentilesCollector, TopHitsTopNComputer,
@@ -33,9 +34,17 @@ use crate::TantivyError;
 /// intermediate results.
 ///
 /// Notice: This struct should not be de/serialized via JSON format.
-#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct IntermediateAggregationResults {
-    pub(crate) aggs_res: FxHashMap<String, IntermediateAggregationResult>,
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IntermediateAggregationResults<I> {
+    pub(crate) aggs_res: FxHashMap<String, IntermediateAggregationResult<I>>,
+}
+
+impl<I> Default for IntermediateAggregationResults<I> {
+    fn default() -> Self {
+        IntermediateAggregationResults {
+            aggs_res: FxHashMap::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialOrd, PartialEq)]
@@ -102,9 +111,13 @@ impl std::hash::Hash for IntermediateKey {
     }
 }
 
-impl IntermediateAggregationResults {
+impl<I: CustomIntermediateRes> IntermediateAggregationResults<I> {
     /// Add a result
-    pub fn push(&mut self, key: String, value: IntermediateAggregationResult) -> crate::Result<()> {
+    pub fn push(
+        &mut self,
+        key: String,
+        value: IntermediateAggregationResult<I>,
+    ) -> crate::Result<()> {
         let entry = self.aggs_res.entry(key);
         match entry {
             Entry::Occupied(mut e) => {
@@ -119,11 +132,14 @@ impl IntermediateAggregationResults {
     }
 
     /// Convert intermediate result and its aggregation request to the final result.
-    pub fn into_final_result(
+    pub fn into_final_result<C>(
         self,
-        req: Aggregations,
+        req: Aggregations<C>,
         mut limits: AggregationLimitsGuard,
-    ) -> crate::Result<AggregationResults> {
+    ) -> crate::Result<AggregationResults<C::FinalRes>>
+    where
+        C: CustomAgg<IntermediateRes = I>,
+    {
         let res = self.into_final_result_internal(&req, &mut limits)?;
         let bucket_count = res.get_bucket_count() as u32;
         if bucket_count > limits.get_bucket_limit() {
@@ -138,12 +154,15 @@ impl IntermediateAggregationResults {
     }
 
     /// Convert intermediate result and its aggregation request to the final result.
-    pub(crate) fn into_final_result_internal(
+    pub(crate) fn into_final_result_internal<C>(
         self,
-        req: &Aggregations,
+        req: &Aggregations<C>,
         limits: &mut AggregationLimitsGuard,
-    ) -> crate::Result<AggregationResults> {
-        let mut results: FxHashMap<String, AggregationResult> = FxHashMap::default();
+    ) -> crate::Result<AggregationResults<C::FinalRes>>
+    where
+        C: CustomAgg<IntermediateRes = I>,
+    {
+        let mut results: FxHashMap<String, AggregationResult<C::FinalRes>> = FxHashMap::default();
         for (key, agg_res) in self.aggs_res.into_iter() {
             let req = req.get(key.as_str()).unwrap_or_else(|| {
                 panic!(
@@ -168,8 +187,10 @@ impl IntermediateAggregationResults {
         Ok(AggregationResults(results))
     }
 
-    pub(crate) fn empty_from_req(req: &Aggregations) -> Self {
-        let mut aggs_res: FxHashMap<String, IntermediateAggregationResult> = FxHashMap::default();
+    pub(crate) fn empty_from_req<C>(req: &Aggregations<C>) -> Self
+    where C: CustomAgg<IntermediateRes = I> {
+        let mut aggs_res: FxHashMap<String, IntermediateAggregationResult<I>> =
+            FxHashMap::default();
         for (key, req) in req.iter() {
             let empty_res = empty_from_req(req);
             aggs_res.insert(key.to_string(), empty_res);
@@ -182,7 +203,7 @@ impl IntermediateAggregationResults {
     ///
     /// The order of the values need to be the same on both results. This is ensured when the same
     /// (key values) are present on the underlying `VecWithNames` struct.
-    pub fn merge_fruits(&mut self, other: IntermediateAggregationResults) -> crate::Result<()> {
+    pub fn merge_fruits(&mut self, other: IntermediateAggregationResults<I>) -> crate::Result<()> {
         for (left, right) in self.aggs_res.values_mut().zip(other.aggs_res.into_values()) {
             left.merge_fruits(right)?;
         }
@@ -190,7 +211,9 @@ impl IntermediateAggregationResults {
     }
 }
 
-pub(crate) fn empty_from_req(req: &Aggregation) -> IntermediateAggregationResult {
+pub(crate) fn empty_from_req<C: CustomAgg>(
+    req: &Aggregation<C>,
+) -> IntermediateAggregationResult<C::IntermediateRes> {
     use AggregationVariants::*;
     match req.agg {
         Terms(_) => IntermediateAggregationResult::Bucket(IntermediateBucketResult::Terms {
@@ -241,24 +264,32 @@ pub(crate) fn empty_from_req(req: &Aggregation) -> IntermediateAggregationResult
         Cardinality(_) => IntermediateAggregationResult::Metric(
             IntermediateMetricResult::Cardinality(CardinalityCollector::default()),
         ),
+        Custom(ref custom) => {
+            IntermediateAggregationResult::Custom(custom.empty_intermediate_res())
+        }
     }
 }
 
 /// An aggregation is either a bucket or a metric.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum IntermediateAggregationResult {
+pub enum IntermediateAggregationResult<I> {
     /// Bucket variant
-    Bucket(IntermediateBucketResult),
+    Bucket(IntermediateBucketResult<I>),
     /// Metric variant
     Metric(IntermediateMetricResult),
+    /// Custom
+    Custom(I),
 }
 
-impl IntermediateAggregationResult {
-    pub(crate) fn into_final_result(
+impl<I: CustomIntermediateRes> IntermediateAggregationResult<I> {
+    pub(crate) fn into_final_result<C>(
         self,
-        req: &Aggregation,
+        req: &Aggregation<C>,
         limits: &mut AggregationLimitsGuard,
-    ) -> crate::Result<AggregationResult> {
+    ) -> crate::Result<AggregationResult<C::FinalRes>>
+    where
+        C: CustomAgg<IntermediateRes = I>,
+    {
         let res = match self {
             IntermediateAggregationResult::Bucket(bucket) => {
                 AggregationResult::BucketResult(bucket.into_final_bucket_result(req, limits)?)
@@ -266,10 +297,13 @@ impl IntermediateAggregationResult {
             IntermediateAggregationResult::Metric(metric) => {
                 AggregationResult::MetricResult(metric.into_final_metric_result(req))
             }
+            IntermediateAggregationResult::Custom(custom) => {
+                AggregationResult::CustomResult(custom.into_final_metric_result(req)?)
+            }
         };
         Ok(res)
     }
-    fn merge_fruits(&mut self, other: IntermediateAggregationResult) -> crate::Result<()> {
+    fn merge_fruits(&mut self, other: IntermediateAggregationResult<I>) -> crate::Result<()> {
         match (self, other) {
             (
                 IntermediateAggregationResult::Bucket(b1),
@@ -310,7 +344,7 @@ pub enum IntermediateMetricResult {
 }
 
 impl IntermediateMetricResult {
-    fn into_final_metric_result(self, req: &Aggregation) -> MetricResult {
+    fn into_final_metric_result<C: CustomAgg>(self, req: &Aggregation<C>) -> MetricResult {
         match self {
             IntermediateMetricResult::Average(intermediate_avg) => {
                 MetricResult::Average(intermediate_avg.finalize().into())
@@ -409,34 +443,37 @@ impl IntermediateMetricResult {
 /// The intermediate bucket results. Internally they can be easily merged via the keys of the
 /// buckets.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum IntermediateBucketResult {
+pub enum IntermediateBucketResult<I> {
     /// This is the range entry for a bucket, which contains a key, count, from, to, and optionally
     /// sub_aggregations.
-    Range(IntermediateRangeBucketResult),
+    Range(IntermediateRangeBucketResult<I>),
     /// This is the histogram entry for a bucket, which contains a key, count, and optionally
     /// sub_aggregations.
     Histogram {
         /// The column_type of the underlying `Column` is DateTime
         is_date_agg: bool,
         /// The histogram buckets
-        buckets: Vec<IntermediateHistogramBucketEntry>,
+        buckets: Vec<IntermediateHistogramBucketEntry<I>>,
     },
     /// Term aggregation
     Terms {
         /// The term buckets
-        buckets: IntermediateTermBucketResult,
+        buckets: IntermediateTermBucketResult<I>,
     },
 }
 
-impl IntermediateBucketResult {
-    pub(crate) fn into_final_bucket_result(
+impl<I: CustomIntermediateRes> IntermediateBucketResult<I> {
+    pub(crate) fn into_final_bucket_result<C>(
         self,
-        req: &Aggregation,
+        req: &Aggregation<C>,
         limits: &mut AggregationLimitsGuard,
-    ) -> crate::Result<BucketResult> {
+    ) -> crate::Result<BucketResult<C::FinalRes>>
+    where
+        C: CustomAgg<IntermediateRes = I>,
+    {
         match self {
             IntermediateBucketResult::Range(range_res) => {
-                let mut buckets: Vec<RangeBucketEntry> = range_res
+                let mut buckets: Vec<RangeBucketEntry<C::FinalRes>> = range_res
                     .buckets
                     .into_values()
                     .map(|bucket| {
@@ -512,7 +549,7 @@ impl IntermediateBucketResult {
         }
     }
 
-    fn merge_fruits(&mut self, other: IntermediateBucketResult) -> crate::Result<()> {
+    fn merge_fruits(&mut self, other: IntermediateBucketResult<I>) -> crate::Result<()> {
         match (self, other) {
             (
                 IntermediateBucketResult::Terms {
@@ -544,7 +581,7 @@ impl IntermediateBucketResult {
                     is_date_agg: _,
                 },
             ) => {
-                let buckets: Result<Vec<IntermediateHistogramBucketEntry>, TantivyError> =
+                let buckets: Result<Vec<IntermediateHistogramBucketEntry<I>>, TantivyError> =
                     buckets_left
                         .drain(..)
                         .merge_join_by(buckets_right, |left, right| {
@@ -576,30 +613,52 @@ impl IntermediateBucketResult {
     }
 }
 
-#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 /// Range aggregation including error counts
-pub struct IntermediateRangeBucketResult {
-    pub(crate) buckets: FxHashMap<SerializedKey, IntermediateRangeBucketEntry>,
+pub struct IntermediateRangeBucketResult<I> {
+    pub(crate) buckets: FxHashMap<SerializedKey, IntermediateRangeBucketEntry<I>>,
     pub(crate) column_type: Option<ColumnType>,
 }
 
-#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+impl<I> Default for IntermediateRangeBucketResult<I> {
+    fn default() -> Self {
+        IntermediateRangeBucketResult {
+            buckets: Default::default(),
+            column_type: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 /// Term aggregation including error counts
-pub struct IntermediateTermBucketResult {
-    pub(crate) entries: FxHashMap<IntermediateKey, IntermediateTermBucketEntry>,
+pub struct IntermediateTermBucketResult<I> {
+    pub(crate) entries: FxHashMap<IntermediateKey, IntermediateTermBucketEntry<I>>,
     pub(crate) sum_other_doc_count: u64,
     pub(crate) doc_count_error_upper_bound: u64,
 }
 
-impl IntermediateTermBucketResult {
-    pub(crate) fn into_final_result(
+impl<I> Default for IntermediateTermBucketResult<I> {
+    fn default() -> Self {
+        IntermediateTermBucketResult {
+            entries: Default::default(),
+            sum_other_doc_count: 0,
+            doc_count_error_upper_bound: 0,
+        }
+    }
+}
+
+impl<I: CustomIntermediateRes> IntermediateTermBucketResult<I> {
+    pub(crate) fn into_final_result<C>(
         self,
         req: &TermsAggregation,
-        sub_aggregation_req: &Aggregations,
+        sub_aggregation_req: &Aggregations<C>,
         limits: &mut AggregationLimitsGuard,
-    ) -> crate::Result<BucketResult> {
+    ) -> crate::Result<BucketResult<C::FinalRes>>
+    where
+        C: CustomAgg<IntermediateRes = I>,
+    {
         let req = TermsAggregationInternal::from_req(req);
-        let mut buckets: Vec<BucketEntry> = self
+        let mut buckets: Vec<BucketEntry<C::FinalRes>> = self
             .entries
             .into_iter()
             .filter(|bucket| bucket.1.doc_count as u64 >= req.min_doc_count)
@@ -710,21 +769,24 @@ fn merge_maps<V: MergeFruits + Clone, T: Eq + PartialEq + Hash>(
 /// This is the histogram entry for a bucket, which contains a key, count, and optionally
 /// sub_aggregations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct IntermediateHistogramBucketEntry {
+pub struct IntermediateHistogramBucketEntry<I> {
     /// The unique the bucket is identified.
     pub key: f64,
     /// The number of documents in the bucket.
     pub doc_count: u64,
     /// The sub_aggregation in this bucket.
-    pub sub_aggregation: IntermediateAggregationResults,
+    pub sub_aggregation: IntermediateAggregationResults<I>,
 }
 
-impl IntermediateHistogramBucketEntry {
-    pub(crate) fn into_final_bucket_entry(
+impl<I: CustomIntermediateRes> IntermediateHistogramBucketEntry<I> {
+    pub(crate) fn into_final_bucket_entry<C>(
         self,
-        req: &Aggregations,
+        req: &Aggregations<C>,
         limits: &mut AggregationLimitsGuard,
-    ) -> crate::Result<BucketEntry> {
+    ) -> crate::Result<BucketEntry<C::FinalRes>>
+    where
+        C: CustomAgg<IntermediateRes = I>,
+    {
         Ok(BucketEntry {
             key_as_string: None,
             key: Key::F64(self.key),
@@ -739,27 +801,30 @@ impl IntermediateHistogramBucketEntry {
 /// This is the range entry for a bucket, which contains a key, count, and optionally
 /// sub_aggregations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct IntermediateRangeBucketEntry {
+pub struct IntermediateRangeBucketEntry<I> {
     /// The unique key the bucket is identified with.
     pub key: IntermediateKey,
     /// The number of documents in the bucket.
     pub doc_count: u64,
     /// The sub_aggregation in this bucket.
-    pub sub_aggregation: IntermediateAggregationResults,
+    pub sub_aggregation: IntermediateAggregationResults<I>,
     /// The from range of the bucket. Equals `f64::MIN` when `None`.
     pub from: Option<f64>,
     /// The to range of the bucket. Equals `f64::MAX` when `None`.
     pub to: Option<f64>,
 }
 
-impl IntermediateRangeBucketEntry {
-    pub(crate) fn into_final_bucket_entry(
+impl<I: CustomIntermediateRes> IntermediateRangeBucketEntry<I> {
+    pub(crate) fn into_final_bucket_entry<C>(
         self,
-        req: &Aggregations,
+        req: &Aggregations<C>,
         _range_req: &RangeAggregation,
         column_type: Option<ColumnType>,
         limits: &mut AggregationLimitsGuard,
-    ) -> crate::Result<RangeBucketEntry> {
+    ) -> crate::Result<RangeBucketEntry<C::FinalRes>>
+    where
+        C: CustomAgg<IntermediateRes = I>,
+    {
         let mut range_bucket_entry = RangeBucketEntry {
             key: self.key.into(),
             doc_count: self.doc_count,
@@ -791,32 +856,41 @@ impl IntermediateRangeBucketEntry {
 
 /// This is the term entry for a bucket, which contains a count, and optionally
 /// sub_aggregations.
-#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct IntermediateTermBucketEntry {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IntermediateTermBucketEntry<I> {
     /// The number of documents in the bucket.
     pub doc_count: u32,
     /// The sub_aggregation in this bucket.
-    pub sub_aggregation: IntermediateAggregationResults,
+    pub sub_aggregation: IntermediateAggregationResults<I>,
 }
 
-impl MergeFruits for IntermediateTermBucketEntry {
-    fn merge_fruits(&mut self, other: IntermediateTermBucketEntry) -> crate::Result<()> {
+impl<I> Default for IntermediateTermBucketEntry<I> {
+    fn default() -> Self {
+        IntermediateTermBucketEntry {
+            doc_count: 0,
+            sub_aggregation: Default::default(),
+        }
+    }
+}
+
+impl<I: CustomIntermediateRes> MergeFruits for IntermediateTermBucketEntry<I> {
+    fn merge_fruits(&mut self, other: IntermediateTermBucketEntry<I>) -> crate::Result<()> {
         self.doc_count += other.doc_count;
         self.sub_aggregation.merge_fruits(other.sub_aggregation)?;
         Ok(())
     }
 }
 
-impl MergeFruits for IntermediateRangeBucketEntry {
-    fn merge_fruits(&mut self, other: IntermediateRangeBucketEntry) -> crate::Result<()> {
+impl<I: CustomIntermediateRes> MergeFruits for IntermediateRangeBucketEntry<I> {
+    fn merge_fruits(&mut self, other: IntermediateRangeBucketEntry<I>) -> crate::Result<()> {
         self.doc_count += other.doc_count;
         self.sub_aggregation.merge_fruits(other.sub_aggregation)?;
         Ok(())
     }
 }
 
-impl MergeFruits for IntermediateHistogramBucketEntry {
-    fn merge_fruits(&mut self, other: IntermediateHistogramBucketEntry) -> crate::Result<()> {
+impl<I: CustomIntermediateRes> MergeFruits for IntermediateHistogramBucketEntry<I> {
+    fn merge_fruits(&mut self, other: IntermediateHistogramBucketEntry<I>) -> crate::Result<()> {
         self.doc_count += other.doc_count;
         self.sub_aggregation.merge_fruits(other.sub_aggregation)?;
         Ok(())
